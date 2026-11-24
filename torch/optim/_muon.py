@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import MutableMapping
+from typing import cast
 
 import torch
 from torch import Tensor
@@ -30,6 +31,30 @@ DEFAULT_C = 2.0315
 DEFAULT_NS_STEPS = 5
 
 
+def _check_newtonschulz_args(
+    ns_coefficients: tuple[float, float, float], ns_steps: int
+) -> None:
+    if ns_steps >= 100:
+        raise ValueError(
+            "Number of steps must be less than 100 for computational efficiency"
+        )
+    if len(ns_coefficients) != 3:
+        raise ValueError("Coefficients must be a tuple of exactly 3 values")
+
+
+def _newtonschulz_iterations(
+    ortho_grad: Tensor, ns_coefficients: tuple[float, float, float], ns_steps: int
+) -> Tensor:
+    a, b, c = ns_coefficients
+    for _ in range(ns_steps):
+        gram_matrix = ortho_grad @ ortho_grad.T
+        gram_update = torch.addmm(
+            gram_matrix, gram_matrix, gram_matrix, beta=b, alpha=c
+        )
+        ortho_grad = torch.addmm(ortho_grad, gram_update, ortho_grad, beta=a)
+    return ortho_grad
+
+
 def _zeropower_via_newtonschulz(
     grad: Tensor, ns_coefficients: tuple[float, float, float], ns_steps: int, eps: float
 ) -> Tensor:
@@ -45,27 +70,15 @@ def _zeropower_via_newtonschulz(
     Implementation reference: https://github.com/KellerJordan/Muon/blob/master/muon.py
     with suggestions by @jxbz, @leloykun, and @YouJiacheng.
     """
-    if ns_steps >= 100:
-        raise ValueError(
-            "Number of steps must be less than 100 for computational efficiency"
-        )
+    _check_newtonschulz_args(ns_coefficients, ns_steps)
     if len(grad.shape) != 2:
         raise ValueError("Input tensor gradient must be a 2D matrix")
-    if len(ns_coefficients) != 3:
-        raise ValueError("Coefficients must be a tuple of exactly 3 values")
-    a, b, c = ns_coefficients
     ortho_grad = grad.to(dtype=torch.bfloat16, copy=True)
     if grad.size(0) > grad.size(1):
         ortho_grad = ortho_grad.T
     # Ensure spectral norm is at most 1
     ortho_grad.div_(ortho_grad.norm().clamp(min=eps))
-    # Perform the NS iterations
-    for _ in range(ns_steps):
-        gram_matrix = ortho_grad @ ortho_grad.T
-        gram_update = torch.addmm(
-            gram_matrix, gram_matrix, gram_matrix, beta=b, alpha=c
-        )
-        ortho_grad = torch.addmm(ortho_grad, gram_update, ortho_grad, beta=a)
+    ortho_grad = _newtonschulz_iterations(ortho_grad, ns_coefficients, ns_steps)
 
     if grad.size(0) > grad.size(1):
         ortho_grad = ortho_grad.T
@@ -391,49 +404,71 @@ def _multi_tensor_muon(
         if g.ndim != 2:
             raise ValueError("Param gradient must be a 2D matrix")
 
-    # Phase 1: momentum buffer update fused across all params.
-    # buf <- lerp(buf, grad, 1 - momentum) for every param in one call.
-    torch._foreach_lerp_(muon_momentum_bufs, grads, 1 - momentum)
-    if nesterov:
-        updates = list(torch._foreach_lerp(grads, muon_momentum_bufs, momentum))
-    else:
-        updates = list(muon_momentum_bufs)
+    _check_newtonschulz_args(ns_coefficients, ns_steps)
 
-    # Phase 2: Newton-Schulz per tensor. Standard NS has no natural batching,
-    # so per-tensor preserves bit-for-bit numerics with _single_tensor_muon.
-    updates = [
-        _zeropower_via_newtonschulz(u, ns_coefficients, ns_steps, eps) for u in updates
-    ]
+    grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
+        [params, grads, muon_momentum_bufs]  # type: ignore[list-item]
+    )
+    for (device_params_, device_grads_, device_bufs_), _ in grouped_tensors.values():
+        device_params = cast(list[Tensor], device_params_)
+        device_grads = cast(list[Tensor], device_grads_)
+        device_bufs = cast(list[Tensor], device_bufs_)
 
-    # Phase 3: weight-decay shrink (uniform scale across all params) followed
-    # by the shape-grouped negative-lr add. Group by shape, dtype, and device
-    # so each _foreach_add_ call preserves per-tensor dtype semantics while
-    # still sharing the shape-specific adjusted_lr.
-    torch._foreach_mul_(params, 1 - lr * weight_decay)
+        # Phase 1: momentum buffer update fused across all params.
+        # buf <- lerp(buf, grad, 1 - momentum) for every param in one call.
+        torch._foreach_lerp_(device_bufs, device_grads, 1 - momentum)
+        if nesterov:
+            updates = list(torch._foreach_lerp(device_grads, device_bufs, momentum))
+        else:
+            updates = list(device_bufs)
 
-    add_groups: dict[
-        tuple[int, int, torch.dtype, torch.dtype, torch.device, torch.device], list[int]
-    ] = {}
-    for i, (p, update) in enumerate(zip(params, updates, strict=True)):
-        add_groups.setdefault(
-            (p.size(0), p.size(1), p.dtype, update.dtype, p.device, update.device),
-            [],
-        ).append(i)
-    for indices in add_groups.values():
-        group_params = [params[i] for i in indices]
-        group_updates = [updates[i] for i in indices]
-        # _foreach_add_ silently falls back to per-tensor add_ when self/other
-        # dtypes differ. NS outputs bf16; params are typically fp32. Cast once
-        # via a fused _foreach_copy_ so _foreach_add_ stays on the multi-tensor
-        # fast path. The cast is bit-equivalent to the per-tensor add_ that the
-        # single-tensor path performs internally.
-        target_dtype = group_params[0].dtype
-        if group_updates[0].dtype != target_dtype:
-            cast = [torch.empty_like(p) for p in group_params]
-            torch._foreach_copy_(cast, group_updates)
-            group_updates = cast
-        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, group_params[0].shape)
-        torch._foreach_add_(group_params, group_updates, alpha=-adjusted_lr)
+        # Phase 2: Newton-Schulz. The cast to bf16 and the normalization by the
+        # (clamped) norm are fused across tensors; the matmul iterations have no
+        # multi-tensor op, so they run per tensor. Each intermediate list is
+        # dropped as soon as it is consumed to keep the peak memory low. The
+        # results are bit-identical to _single_tensor_muon.
+        ortho = [torch.empty_like(u, dtype=torch.bfloat16) for u in updates]
+        torch._foreach_copy_(ortho, updates)
+        del updates
+        norms = torch._foreach_norm(ortho)
+        torch._foreach_clamp_min_(norms, eps)
+        torch._foreach_div_(ortho, norms)
+        del norms
+        for i, x in enumerate(ortho):
+            tall = x.size(0) > x.size(1)
+            x = _newtonschulz_iterations(x.T if tall else x, ns_coefficients, ns_steps)
+            ortho[i] = x.T if tall else x
+
+        # Phase 3: weight-decay shrink (uniform scale across all params) followed
+        # by the shape-grouped negative-lr add. Group by shape, dtype, and device
+        # so each _foreach_add_ call preserves per-tensor dtype semantics while
+        # still sharing the shape-specific adjusted_lr.
+        torch._foreach_mul_(device_params, 1 - lr * weight_decay)
+
+        add_groups: dict[
+            tuple[int, int, torch.dtype, torch.dtype, torch.device, torch.device],
+            list[int],
+        ] = {}
+        for i, (p, update) in enumerate(zip(device_params, ortho, strict=True)):
+            add_groups.setdefault(
+                (p.size(0), p.size(1), p.dtype, update.dtype, p.device, update.device),
+                [],
+            ).append(i)
+        for indices in add_groups.values():
+            group_params = [device_params[i] for i in indices]
+            group_updates = [ortho[i] for i in indices]
+            # _foreach_add_ silently falls back to per-tensor add_ when self/other
+            # dtypes differ. NS outputs bf16; params are typically fp32. Cast once
+            # via a fused _foreach_copy_ so _foreach_add_ stays on the multi-tensor
+            # fast path. The cast is bit-equivalent to the per-tensor add_ that the
+            # single-tensor path performs internally.
+            target_dtype = group_params[0].dtype
+            if group_updates[0].dtype != target_dtype:
+                cast_updates = [torch.empty_like(p) for p in group_params]
+                torch._foreach_copy_(cast_updates, group_updates)
+                group_updates = cast_updates
+            adjusted_lr = _adjust_lr(lr, adjust_lr_fn, group_params[0].shape)
+            torch._foreach_add_(group_params, group_updates, alpha=-adjusted_lr)
 
 
 @_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_muon)
