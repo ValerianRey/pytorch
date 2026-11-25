@@ -267,6 +267,7 @@ class BenchmarkRunner:
                     print(
                         f"Run: {run}, {mode} Execution Time (us) : {results['reported_run_time_us'][run]:.3f}"
                     )
+                print(f"Peak Memory (KB) : {results['peak_memory']}")
                 print()
             else:
                 print(
@@ -739,7 +740,7 @@ class BenchmarkRunner:
                 ]
                 result_dict = dict()
                 result_dict["reported_run_time_us"] = [r[0] for r in results]
-                result_dict["peak_memory"] = results[0][1]
+                result_dict["peak_memory"] = sum(r[1] for r in results) / len(results)
 
                 # Calculate memory bandwidth if operator provides memory traffic
                 memory_traffic_bytes = test_case.op_bench.get_memory_traffic_bytes()
